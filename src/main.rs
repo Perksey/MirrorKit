@@ -1,5 +1,7 @@
 use clap::Parser;
+use hex::ToHex;
 use notify::Watcher;
+use sha1::Digest;
 
 mod cli;
 pub mod schema;
@@ -94,7 +96,34 @@ async fn main() -> anyhow::Result<()> {
                 .launch()
                 .await?;
         }
-        cli::Commands::RxServer { list, import, work } => todo!(),
+        cli::Commands::RxServer { list, import, work } => {
+            if !import.is_dir() {
+                println!("--export path must exist and be a path to a directory.");
+                anyhow::bail!("Dir not found: --export");
+            }
+
+            if !work.is_dir() {
+                println!("--work path must exist and be a path to a directory.");
+                anyhow::bail!("Dir not found: --work");
+            }
+
+            let mut repos: std::collections::HashMap<String, schema::Repo> = if list.exists() {
+                log::info!("Attempting to read repos list...");
+                serde_json::from_slice(&tokio::fs::read(&list).await?)?
+            } else {
+                std::collections::HashMap::new()
+            };
+
+            log::info!("Performing initial processing...");
+            if process_bundles(&mut repos, &import, &work).await? {
+                tokio::fs::write(&list, serde_json::to_vec_pretty(&repos)?).await?;
+            }
+
+            let (_watcher, rx) = start_file_watcher(import.canonicalize()?);
+
+            log::info!("Ready to go.");
+            rx_server(&list, &import, &work, rx).await;
+        }
         cli::Commands::Add {
             list,
             name,
@@ -206,6 +235,7 @@ fn start_file_watcher(
             }
         })
         .expect("failed to create watcher");
+    log::debug!("starting file watcher on \"{:?}\"", path);
     watcher
         .watch(&path, notify::RecursiveMode::Recursive)
         .expect("failed to wtach");
@@ -226,35 +256,7 @@ async fn process_repos(
                 log::info!("Processing \"{}\"...", name);
 
                 let clone_path = work.join(name);
-                if clone_path.is_dir() {
-                    let out = tokio::process::Command::new("git")
-                        .arg("fetch")
-                        .arg("--all")
-                        .current_dir(&clone_path)
-                        .stdout(std::process::Stdio::inherit())
-                        .stderr(std::process::Stdio::inherit())
-                        .output()
-                        .await?;
-                    if !out.status.success() {
-                        anyhow::bail!("fetch failed!");
-                    }
-                } else {
-                    if clone_path.is_file() {
-                        tokio::fs::remove_file(&clone_path).await?;
-                    }
-                    let out = tokio::process::Command::new("git")
-                        .arg("clone")
-                        .arg("--bare")
-                        .arg(&repo.src)
-                        .arg(&clone_path)
-                        .stdout(std::process::Stdio::inherit())
-                        .stderr(std::process::Stdio::inherit())
-                        .output()
-                        .await?;
-                    if !out.status.success() {
-                        anyhow::bail!("clone failed!");
-                    }
-                }
+                clone_repo(&clone_path, repo, true).await?;
 
                 let all_refs = schema::get_all_refs(&clone_path).await?;
                 log::trace!("All refs: {:?}", all_refs);
@@ -316,6 +318,154 @@ async fn process_repos(
     Ok(any_tx)
 }
 
+pub async fn process_bundles(
+    repos: &mut std::collections::HashMap<String, schema::Repo>,
+    import: &std::path::PathBuf,
+    work: &std::path::PathBuf,
+) -> anyhow::Result<bool> {
+    log::info!("Processing bundles...");
+    let mut any_rx = false;
+    for bundle_opt in std::fs::read_dir(import)? {
+        if let Ok(bundle) = bundle_opt {
+            log::debug!("Checking \"{:?}\"", bundle.file_name());
+            if !bundle
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".gitmanifest.json")
+            {
+                continue;
+            }
+            let path = bundle.path();
+            if !path.is_file() {
+                continue;
+            }
+            if repos
+                .iter()
+                .any(|(_, repo)| repo.shas.contains(&*path.as_os_str().to_string_lossy()))
+            {
+                log::debug!(
+                    "File name \"{:?}\" has been processed before, not looking further.",
+                    path
+                );
+                continue;
+            }
+            log::debug!("Reading {:?}...", path);
+            let bundle: schema::Bundle = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
+            let bundle_file = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("gitmanifest should have parent path"))?
+                .join(&bundle.filename);
+            if !bundle_file.exists() {
+                log::warn!("Bundle file doesn't exist, skipping this bundle.");
+                continue;
+            }
+            // Anti-replay checks
+            if repos
+                .iter()
+                .any(|(_, repo)| repo.shas.contains(&bundle.uuid.to_string()))
+            {
+                log::debug!(
+                    "UUID of \"{:?}\" has been processed before, not looking further.",
+                    path
+                );
+                continue;
+            }
+            // Convert back to a string before getting a sha so we can eliminate any differences in pretty printing etc.
+            let sha_input = serde_json::to_vec(&bundle)?;
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(&sha_input);
+            let digest = hasher.finalize();
+            if repos
+                .iter()
+                .any(|(_, repo)| repo.shas.contains(&digest.encode_hex::<String>()))
+            {
+                log::debug!(
+                    "SHA of \"{:?}\" has been processed before, not looking further.",
+                    path
+                );
+                continue;
+            }
+            // Bundle is good, let's process it.
+            // Convert the destination repo URL to something we can store on a file system (as we don't know the
+            // "friendly name" on the rx side)
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(&bundle.dst);
+            let key = hex::encode(hasher.finalize());
+            // Get or create the repo in our "database"
+            let repo = repos.entry(key.clone()).or_insert(schema::Repo {
+                src: bundle.src.clone(),
+                dst: bundle.dst.clone(),
+                status: schema::TxStatus::UpToDate, // not used by rx
+                refs: std::collections::HashMap::new(),
+                shas: std::collections::HashSet::new(),
+            });
+            // Clone the destination repo
+            let clone_path = work.join(key);
+            clone_repo(&clone_path, repo, false).await?;
+            // Unbundle the... bundle
+            process_bundle(&clone_path, &bundle_file, &bundle).await?;
+            repo.shas.insert(digest.encode_hex::<String>());
+            repo.shas.insert(bundle.uuid.to_string());
+            repo.shas
+                .insert(path.as_os_str().to_string_lossy().to_string());
+            any_rx = true;
+        } else {
+            log::error!("Failed to read bundle: {:?}", bundle_opt);
+        }
+    }
+    Ok(any_rx)
+}
+
+async fn process_bundle(
+    clone_path: &std::path::PathBuf,
+    bundle_path: &std::path::PathBuf,
+    bundle: &schema::Bundle,
+) -> anyhow::Result<()> {
+    // Unbundle
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("bundle")
+        .arg("unbundle")
+        .arg(bundle_path.canonicalize()?)
+        .current_dir(clone_path);
+    log::debug!("Executing command: {:?}", cmd);
+    anyhow::ensure!(cmd.output().await?.status.success());
+
+    for (name, kind) in &bundle.removed {
+        let ref_name = match kind {
+            schema::RefKind::Branch => format!(":refs/tags/{}", name),
+            schema::RefKind::Tag => format!(":refs/heads/{}", name),
+        };
+
+        let out = tokio::process::Command::new("git")
+            .arg("push")
+            .arg("-d")
+            .arg("origin")
+            .arg(ref_name)
+            .current_dir(clone_path)
+            .output()
+            .await?;
+        anyhow::ensure!(out.status.success());
+    }
+
+    for (name, ref_data) in bundle.added.iter().chain(bundle.modified.iter()) {
+        let push_ref = match ref_data.kind {
+            schema::RefKind::Branch => format!("{}:refs/heads/{}", ref_data.sha, name),
+            schema::RefKind::Tag => format!("{}:refs/tags/{}", ref_data.sha, name),
+        };
+
+        let out = tokio::process::Command::new("git")
+            .arg("push")
+            .arg("-f")
+            .arg("origin")
+            .arg(push_ref)
+            .current_dir(clone_path)
+            .output()
+            .await?;
+        anyhow::ensure!(out.status.success());
+    }
+    Ok(())
+}
+
 async fn tx_server(
     list: &std::path::PathBuf,
     export: &std::path::PathBuf,
@@ -326,7 +476,7 @@ async fn tx_server(
     let mut attempts = 0;
     loop {
         if changed {
-            match process_once(list, export, work).await {
+            match tx_process_once(list, export, work).await {
                 Ok(()) => {
                     changed = false;
                     attempts = 0
@@ -361,7 +511,54 @@ async fn tx_server(
     }
 }
 
-async fn process_once(
+async fn rx_server(
+    list: &std::path::PathBuf,
+    import: &std::path::PathBuf,
+    work: &std::path::PathBuf,
+    mut rx: tokio::sync::mpsc::Receiver<Vec<std::path::PathBuf>>,
+) {
+    let mut changed = true;
+    let mut attempts = 0;
+    loop {
+        if changed {
+            match rx_process_once(list, import, work).await {
+                Ok(()) => {
+                    changed = false;
+                    attempts = 0
+                }
+                Err(err) => {
+                    if attempts >= 10 && work.exists() {
+                        log::warn!("Deleting cache in an attempt to fix the issue...");
+                        std::fs::remove_dir_all(work).expect("failed to delete cache");
+                    } else if attempts > 15 {
+                        panic!(
+                            "Failed to process bundles: {}",
+                            anyhow::format_err!("{:?}", err)
+                        );
+                    }
+
+                    log::error!(
+                        "Failed to process bundle, will retry in 1 second: {:?}",
+                        err
+                    );
+
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    attempts += 1;
+                }
+            }
+        } else if let Some(path) = rx.recv().await {
+            changed = path.iter().any(|x| {
+                x.to_str()
+                    .map_or(false, |x| x.ends_with(".gitmanifest.json"))
+            });
+        } else {
+            // hung up
+            panic!("file watcher hung up");
+        }
+    }
+}
+
+async fn tx_process_once(
     list: &std::path::PathBuf,
     export: &std::path::PathBuf,
     work: &std::path::PathBuf,
@@ -369,6 +566,64 @@ async fn process_once(
     let mut repos = serde_json::from_slice(&tokio::fs::read(list).await?)?;
     if process_repos(&mut repos, export, work).await? {
         tokio::fs::write(list, serde_json::to_vec_pretty(&repos)?).await?;
+    }
+    Ok(())
+}
+
+async fn rx_process_once(
+    list: &std::path::PathBuf,
+    import: &std::path::PathBuf,
+    work: &std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let mut repos: std::collections::HashMap<String, schema::Repo> = if list.exists() {
+        log::info!("Attempting to read repos list...");
+        serde_json::from_slice(&tokio::fs::read(&list).await?)?
+    } else {
+        std::collections::HashMap::new()
+    };
+    if process_bundles(&mut repos, import, work).await? {
+        tokio::fs::write(list, serde_json::to_vec_pretty(&repos)?).await?;
+    }
+    Ok(())
+}
+
+async fn clone_repo(
+    clone_path: &std::path::PathBuf,
+    repo: &schema::Repo,
+    src: bool,
+) -> anyhow::Result<()> {
+    if clone_path.is_dir() && !repo.shas.is_empty() {
+        let out = tokio::process::Command::new("git")
+            .arg("fetch")
+            .arg("--tags")
+            .arg("origin")
+            .arg("+refs/remotes/origin/*:reads/heads/*")
+            .current_dir(clone_path)
+            .output()
+            .await?;
+        if !out.status.success() {
+            anyhow::bail!("fetch failed!");
+        }
+    } else {
+        if clone_path.is_file() {
+            tokio::fs::remove_file(&clone_path).await?;
+        } else if clone_path.is_dir() {
+            // If we have no shas in our JSON repo, that means the folder might reflect an old (now deleted)
+            // repo with the same name
+            tokio::fs::remove_dir_all(&clone_path).await?;
+        }
+        let out = tokio::process::Command::new("git")
+            .arg("clone")
+            .arg("--bare")
+            .arg(if src { &repo.src } else { &repo.dst })
+            .arg(clone_path)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .await?;
+        if !out.status.success() {
+            anyhow::bail!("clone failed!");
+        }
     }
     Ok(())
 }

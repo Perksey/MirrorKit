@@ -16,7 +16,7 @@ pub struct Repo {
     pub refs: std::collections::HashMap<String, RefKind>,
 
     /// - **Tx**: The Git SHAs that have been sent to the remote. Used in calculation of delta bundles.
-    /// - **Rx**: The manifest SHAs that have been received (for anti-replay).
+    /// - **Rx**: The manifest SHAs that have been received (for anti-replay). This may also contain file names as well.
     pub shas: std::collections::HashSet<String>,
 }
 
