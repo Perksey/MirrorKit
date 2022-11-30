@@ -6,43 +6,89 @@ use sha1::Digest;
 mod cli;
 pub mod schema;
 
-#[rocket::post("/gitlab", data = "<data>")]
+#[rocket::post("/gitlab?<dst>&<ssh>", data = "<data>")]
 async fn webhook(
     data: rocket::serde::json::Json<gitlab::webhooks::WebHook>,
     list: &rocket::State<std::path::PathBuf>,
+    ssh: Option<bool>,
+    dst: String,
 ) -> Result<(), rocket::response::status::Custom<()>> {
-    webhook_inner(data, list).await.map_err(|err| {
-        log::error!(
-            "Error in handling webhook: {}",
-            anyhow::format_err!("{}", err)
-        );
-        rocket::response::status::Custom(rocket::http::Status::InternalServerError, ())
-    })
+    webhook_inner(data, list, dst, ssh.unwrap_or_default())
+        .await
+        .map_err(|err| {
+            log::error!(
+                "Error in handling webhook: {}",
+                anyhow::format_err!("{}", err)
+            );
+            rocket::response::status::Custom(rocket::http::Status::InternalServerError, ())
+        })
 }
 
 async fn webhook_inner(
     data: rocket::serde::json::Json<gitlab::webhooks::WebHook>,
     list: &rocket::State<std::path::PathBuf>,
+    dst: String,
+    ssh: bool,
 ) -> anyhow::Result<()> {
     if let gitlab::webhooks::WebHook::Push(push_data) = data.0 {
-        let repos: std::collections::HashMap<String, schema::Repo> =
-            serde_json::from_slice(&tokio::fs::read(&**list).await?)?;
-        if let Some((name, _)) = repos.into_iter().find(|(x, y)| {
-            y.src.trim_matches('/') == push_data.project.git_http_url.trim_matches('/')
-                || y.src.trim_matches('/') == push_data.project.git_ssh_url.trim_matches('/')
-                || y.src.trim_matches('/') == push_data.project.web_url.trim_matches('/')
+        webhook_tx(
+            list,
+            &push_data.ref_,
+            &push_data.project.git_http_url,
+            &push_data.project.git_ssh_url,
+            &push_data.project.web_url,
+            dst,
+            ssh,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn webhook_tx(
+    list: &std::path::PathBuf,
+    ref_name: &str,
+    http: &str,
+    ssh: &str,
+    web: &str,
+    dst: String,
+    prefer_ssh: bool,
+) -> anyhow::Result<()> {
+    let mut repos: std::collections::HashMap<String, schema::Repo> =
+        serde_json::from_slice(&tokio::fs::read(&**list).await?)?;
+    if let Some((name, _)) = repos.iter().find(|(_, y)| {
+        y.src.trim_matches('/') == http.trim_matches('/')
+            || y.src.trim_matches('/') == ssh.trim_matches('/')
+            || y.src.trim_matches('/') == web.trim_matches('/')
+    }) {
+        let branch = ref_name
+            .strip_prefix("refs/heads/")
+            .unwrap_or_else(|| ref_name.strip_prefix("refs/tags/").unwrap_or(ref_name));
+        tx_repo(list, name.to_string(), vec![branch.to_string()], false).await?;
+    } else {
+        if repos.iter().any(|x| {
+            x.1.dst.trim_matches('/').to_lowercase() == dst.trim_matches('/').to_lowercase()
         }) {
-            let branch = push_data
-                .ref_
-                .strip_prefix("refs/heads/")
-                .unwrap_or_else(|| {
-                    push_data
-                        .ref_
-                        .strip_prefix("refs/tags/")
-                        .unwrap_or(&push_data.ref_)
-                });
-            tx_repo(list, name, vec![branch.to_string()], false).await?;
+            anyhow::bail!(
+                "Attempted to add a repo that will conflict with an existing destination."
+            );
         }
+
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(http);
+        let name = hex::encode(hasher.finalize());
+        repos.insert(
+            name,
+            schema::Repo {
+                src: if prefer_ssh { ssh } else { http }.to_string(),
+                dst,
+                status: schema::TxStatus::FullTxNeeded(std::collections::HashSet::new()),
+                refs: std::collections::HashMap::new(),
+                shas: std::collections::HashSet::new(),
+            },
+        );
+
+        tokio::fs::write(list, serde_json::to_vec_pretty(&repos)?).await?;
     }
     Ok(())
 }
@@ -244,8 +290,8 @@ fn start_file_watcher(
 
 async fn process_repos(
     repos: &mut std::collections::HashMap<String, schema::Repo>,
-    export: &std::path::PathBuf,
-    work: &std::path::PathBuf,
+    export: &std::path::Path,
+    work: &std::path::Path,
 ) -> anyhow::Result<bool> {
     let mut any_tx = false;
     for (name, repo) in repos {
@@ -321,7 +367,7 @@ async fn process_repos(
 pub async fn process_bundles(
     repos: &mut std::collections::HashMap<String, schema::Repo>,
     import: &std::path::PathBuf,
-    work: &std::path::PathBuf,
+    work: &std::path::Path,
 ) -> anyhow::Result<bool> {
     log::info!("Processing bundles...");
     let mut any_rx = false;
@@ -418,7 +464,7 @@ pub async fn process_bundles(
 
 async fn process_bundle(
     clone_path: &std::path::PathBuf,
-    bundle_path: &std::path::PathBuf,
+    bundle_path: &std::path::Path,
     bundle: &schema::Bundle,
 ) -> anyhow::Result<()> {
     // Unbundle
@@ -482,14 +528,14 @@ async fn tx_server(
                     attempts = 0
                 }
                 Err(err) => {
-                    if attempts >= 10 && work.exists() {
-                        log::warn!("Deleting cache in an attempt to fix the issue...");
-                        std::fs::remove_dir_all(work).expect("failed to delete cache");
-                    } else if attempts > 15 {
+                    if attempts > 15 {
                         panic!(
                             "Failed to process repos: {}",
                             anyhow::format_err!("{:?}", err)
                         );
+                    } else if attempts >= 10 && work.exists() {
+                        log::warn!("Deleting cache in an attempt to fix the issue...");
+                        std::fs::remove_dir_all(work).expect("failed to delete cache");
                     }
 
                     log::error!(
@@ -597,7 +643,7 @@ async fn clone_repo(
             .arg("fetch")
             .arg("--tags")
             .arg("origin")
-            .arg("+refs/remotes/origin/*:reads/heads/*")
+            .arg("+refs/*:refs/*")
             .current_dir(clone_path)
             .output()
             .await?;

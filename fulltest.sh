@@ -44,7 +44,7 @@
     EXPECTED_REV=$(git rev-parse HEAD)
     cd ../..
     sleep 1
-    cargo run -- tx fulltest/tx.json "test" master
+    cargo run -- tx fulltest/tx.json "test"
     sleep 1
     cd fulltest/rx_repo
     ACTUAL_REV=$(git rev-parse refs/heads/master)
