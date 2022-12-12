@@ -638,19 +638,7 @@ async fn clone_repo(
     repo: &schema::Repo,
     src: bool,
 ) -> anyhow::Result<()> {
-    if clone_path.is_dir() && !repo.shas.is_empty() {
-        let out = tokio::process::Command::new("git")
-            .arg("fetch")
-            .arg("--tags")
-            .arg("origin")
-            .arg("+refs/*:refs/*")
-            .current_dir(clone_path)
-            .output()
-            .await?;
-        if !out.status.success() {
-            anyhow::bail!("fetch failed!");
-        }
-    } else {
+    if !clone_path.is_dir() || repo.shas.is_empty() {
         if clone_path.is_file() {
             tokio::fs::remove_file(&clone_path).await?;
         } else if clone_path.is_dir() {
@@ -670,6 +658,27 @@ async fn clone_repo(
         if !out.status.success() {
             anyhow::bail!("clone failed!");
         }
+    }
+
+    let out = tokio::process::Command::new("git")
+        .arg("fetch")
+        .arg("--all")
+        .current_dir(clone_path)
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!("fetch failed!");
+    }
+    let out = tokio::process::Command::new("git")
+        .arg("fetch")
+        .arg("--tags")
+        .arg("origin")
+        .arg("+refs/*:refs/*")
+        .current_dir(clone_path)
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!("fetch failed!");
     }
     Ok(())
 }
